@@ -12,7 +12,7 @@ const MAX_BYTES = 5 * 1024 * 1024;
 const cors = {
   "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Recorder-Secret, X-Page-Id, X-File-Name, X-Caption",
+  "Access-Control-Allow-Headers": "Content-Type, X-Recorder-Secret, X-Page-Id, X-File-Name, X-Caption, X-Action, X-Block-Id, X-Match",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -44,6 +44,8 @@ export default {
     const pageId = (request.headers.get("X-Page-Id") || "").replace(/-/g, "");
     if (!/^[0-9a-f]{32}$/.test(pageId)) return reply(400, { error: "페이지 ID가 올바르지 않습니다." });
 
+    if (request.headers.get("X-Action") === "delete") return removeAudio(request, env, pageId);
+
     const contentType = (request.headers.get("Content-Type") || "").split(";")[0];
     if (!["audio/mp4", "audio/wav", "audio/mpeg"].includes(contentType))
       return reply(415, { error: "지원하지 않는 오디오 형식: " + contentType });
@@ -53,10 +55,7 @@ export default {
     if (body.byteLength > MAX_BYTES) return reply(413, { error: "5MB를 넘는 녹음은 올릴 수 없습니다." });
 
     try {
-      // 대상 페이지가 스피치 데이터베이스의 행인지 확인
-      const page = await notion(env, "pages/" + pageId);
-      const parentDb = (page.parent && page.parent.database_id || "").replace(/-/g, "");
-      if (parentDb !== ALLOWED_DATABASE) return reply(403, { error: "허용되지 않은 페이지입니다." });
+      if (!(await isAllowedPage(env, pageId))) return reply(403, { error: "허용되지 않은 페이지입니다." });
 
       const ext = contentType === "audio/mp4" ? "m4a" : contentType === "audio/wav" ? "wav" : "mp3";
       const rawName = decodeURIComponent(request.headers.get("X-File-Name") || "") || "내녹음";
@@ -73,7 +72,7 @@ export default {
       await notion(env, "file_uploads/" + upload.id + "/send", { method: "POST", body: form });
 
       const caption = decodeURIComponent(request.headers.get("X-Caption") || "").slice(0, 200);
-      await notion(env, "blocks/" + pageId + "/children", {
+      const added = await notion(env, "blocks/" + pageId + "/children", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -88,9 +87,53 @@ export default {
         }),
       });
 
-      return reply(200, { ok: true });
+      const block = (added.results || []).find(b => b.type === "audio");
+      return reply(200, { ok: true, blockId: block ? block.id : "" });
     } catch (e) {
       return reply(502, { error: String(e.message || e) });
     }
   },
 };
+
+// 스피치 데이터베이스의 행인지 확인
+async function isAllowedPage(env, pageId) {
+  const page = await notion(env, "pages/" + pageId);
+  return (page.parent && page.parent.database_id || "").replace(/-/g, "") === ALLOWED_DATABASE;
+}
+
+// 페이지에 붙은 녹음(오디오 블록)을 노션 휴지통으로 보낸다.
+// X-Block-Id가 있으면 그 블록, 없으면 캡션에 X-Match(녹음 시각)가 들어간 오디오 블록.
+async function removeAudio(request, env, pageId) {
+  try {
+    if (!(await isAllowedPage(env, pageId))) return reply(403, { error: "허용되지 않은 페이지입니다." });
+
+    const blockId = (request.headers.get("X-Block-Id") || "").replace(/-/g, "");
+    const match = decodeURIComponent(request.headers.get("X-Match") || "");
+    let target = "";
+
+    if (/^[0-9a-f]{32}$/.test(blockId)) {
+      const block = await notion(env, "blocks/" + blockId);
+      if (block.archived || block.in_trash) return reply(200, { ok: true, already: true });
+      if (block.type !== "audio" || (block.parent && block.parent.page_id || "").replace(/-/g, "") !== pageId)
+        return reply(403, { error: "이 페이지의 녹음이 아닙니다." });
+      target = blockId;
+    } else if (match) {
+      let cursor;
+      do {
+        const list = await notion(env, "blocks/" + pageId + "/children?page_size=100" + (cursor ? "&start_cursor=" + cursor : ""));
+        const hit = list.results.find(b => b.type === "audio" &&
+          (b.audio.caption || []).map(c => c.plain_text).join("").includes(match));
+        if (hit) { target = hit.id; break; }
+        cursor = list.has_more ? list.next_cursor : null;
+      } while (cursor);
+      if (!target) return reply(200, { ok: true, already: true });
+    } else {
+      return reply(400, { error: "삭제할 녹음을 찾을 정보가 없습니다." });
+    }
+
+    await notion(env, "blocks/" + target, { method: "DELETE" });
+    return reply(200, { ok: true });
+  } catch (e) {
+    return reply(502, { error: String(e.message || e) });
+  }
+}

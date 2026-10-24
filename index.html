@@ -133,8 +133,32 @@ const $ = id => document.getElementById(id);
 const pad = n => String(n).padStart(2, '0');
 const fmt = s => pad(Math.floor(s / 60)) + ':' + pad(Math.floor(s % 60));
 const stamp = t => { const d = new Date(t); return d.getFullYear() + '.' + pad(d.getMonth() + 1) + '.' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+const ymd = t => { const d = new Date(t); return d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()); };
+// 저장 이름: 녹음날짜_주제_번호 (예: 20261024_0706 뉴스_001)
+const baseName = t => ymd(t.created) + '_' + (topic || '녹음') + '_' + String(t.seq || 0).padStart(3, '0');
 const urls = [];
 const sending = new Set();
+const removing = new Set();
+
+// 번호가 없는 예전 녹음에 녹음 순서대로 번호를 매긴다
+async function ensureSeq(takes) {
+  let max = takes.reduce((m, t) => Math.max(m, t.seq || 0), 0);
+  for (const t of [...takes].sort((a, b) => a.created - b.created)) {
+    if (!t.seq) { t.seq = ++max; await putTake(t); }
+  }
+  return max;
+}
+
+async function callWorker(headers, body) {
+  const res = await fetch(WORKER_URL, {
+    method: 'POST',
+    headers: { 'X-Recorder-Secret': store.get('recorderSecret'), 'X-Page-Id': pageId, ...headers },
+    body,
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(out.error || ('오류 ' + res.status));
+  return out;
+}
 function showErr(msg) { $('err').textContent = msg; $('err').style.display = 'block'; }
 
 const canUpload = () => !!(WORKER_URL && pageId);
@@ -175,28 +199,26 @@ async function toUploadable(blob) {
   return { blob: new Blob([view], { type: 'audio/wav' }), type: 'audio/wav' };
 }
 
-async function upload(take, label) {
-  const secret = store.get('recorderSecret');
-  if (!secret) { $('settings').open = true; showErr('노션에 저장하려면 아래 "노션 연결 설정"에서 비밀 문구를 먼저 입력해 주세요.'); return false; }
+function needSecret() {
+  if (store.get('recorderSecret')) return false;
+  $('settings').open = true;
+  showErr('노션에 저장·삭제하려면 아래 "노션 연결 설정"에서 비밀 문구를 먼저 입력해 주세요.');
+  return true;
+}
+
+async function upload(take) {
+  if (needSecret()) return false;
   sending.add(take.id); render();
   try {
     const { blob, type } = await toUploadable(take.blob);
     if (blob.size > 5 * 1024 * 1024) throw new Error('5MB를 넘는 녹음은 노션에 올릴 수 없습니다(약 5분 이내로 녹음해 주세요).');
-    const d = new Date(take.created);
-    const res = await fetch(WORKER_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': type,
-        'X-Recorder-Secret': secret,
-        'X-Page-Id': pageId,
-        'X-File-Name': encodeURIComponent((topic || '녹음') + '_내녹음_' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '_' + pad(d.getHours()) + pad(d.getMinutes())),
-        'X-Caption': encodeURIComponent(label + ' · ' + stamp(take.created) + ' · ' + fmt(take.duration || 0)),
-      },
-      body: blob,
-    });
-    const out = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(out.error || ('오류 ' + res.status));
+    const out = await callWorker({
+      'Content-Type': type,
+      'X-File-Name': encodeURIComponent(baseName(take)),
+      'X-Caption': encodeURIComponent(baseName(take) + ' · ' + stamp(take.created) + ' · ' + fmt(take.duration || 0)),
+    }, blob);
     take.notion = 'done';
+    take.blockId = out.blockId || '';
   } catch (e) {
     take.notion = 'failed';
     showErr('노션 저장 실패: ' + e.message);
@@ -207,10 +229,33 @@ async function upload(take, label) {
   return take.notion === 'done';
 }
 
+async function unpublish(take) {
+  if (needSecret()) return;
+  if (!confirm('노션 페이지에서 이 녹음(' + baseName(take) + ')을 삭제할까요?\n이 기기의 녹음은 남아 있어 다시 올릴 수 있습니다.')) return;
+  $('err').style.display = 'none';
+  removing.add(take.id); render();
+  try {
+    // blockId가 없는 예전 녹음은 노션 캡션의 녹음 시각으로 찾는다
+    await callWorker({
+      'X-Action': 'delete',
+      'X-Block-Id': take.blockId || '',
+      'X-Match': encodeURIComponent(stamp(take.created)),
+    });
+    take.notion = '';
+    take.blockId = '';
+    await putTake(take);
+  } catch (e) {
+    showErr('노션 삭제 실패: ' + e.message);
+  }
+  removing.delete(take.id);
+  render();
+}
+
 async function render() {
   urls.splice(0).forEach(u => URL.revokeObjectURL(u));
   let takes = [];
   try { takes = await listTakes(); } catch (e) { showErr('이 브라우저에서는 녹음을 저장할 수 없습니다(사생활 보호 모드 등).'); }
+  try { await ensureSeq(takes); } catch (e) {}
   takes.sort((a, b) => b.created - a.created);
   $('count').textContent = takes.length ? takes.length + '개' : '';
   const ul = $('list');
@@ -219,24 +264,29 @@ async function render() {
     ul.innerHTML = '<li class="empty">아직 녹음이 없습니다.</li>';
     return;
   }
-  takes.forEach((t, i) => {
-    const label = (takes.length - i) + '번째 녹음';
+  takes.forEach(t => {
     const li = document.createElement('li');
     const url = URL.createObjectURL(t.blob); urls.push(url);
-    li.innerHTML = '<div class="row"><div><b></b> <span style="color:var(--muted)"></span></div><div class="acts"></div></div><audio controls preload="metadata"></audio>';
-    li.querySelector('b').textContent = label;
+    li.innerHTML = '<div class="row"><div><b></b><br><span style="color:var(--muted)"></span></div><div class="acts"></div></div><audio controls preload="metadata"></audio>';
+    li.querySelector('b').textContent = baseName(t);
     li.querySelector('span').textContent = stamp(t.created) + ' · ' + fmt(t.duration || 0);
     li.querySelector('audio').src = url;
     const acts = li.querySelector('.acts');
     if (canUpload()) {
       if (t.notion === 'done') {
         acts.insertAdjacentHTML('beforeend', '<span class="badge ok">노션에 저장됨 ✓</span>');
+        const rm = document.createElement('button');
+        rm.className = 's del';
+        rm.textContent = removing.has(t.id) ? '노션에서 삭제 중…' : '노션에서 삭제';
+        rm.disabled = removing.has(t.id);
+        rm.onclick = () => unpublish(t);
+        acts.appendChild(rm);
       } else {
         const b = document.createElement('button');
         b.className = 's up';
         b.textContent = sending.has(t.id) ? '저장 중…' : t.notion === 'failed' ? '노션에 다시 저장' : '노션에 저장';
         b.disabled = sending.has(t.id);
-        b.onclick = () => upload(t, label);
+        b.onclick = () => upload(t);
         acts.appendChild(b);
       }
     }
@@ -246,13 +296,13 @@ async function render() {
       const ext = (t.type || '').includes('mp4') ? 'm4a' : (t.type || '').includes('ogg') ? 'ogg' : 'webm';
       const a = document.createElement('a');
       a.href = url;
-      a.download = (topic || '녹음') + '_내녹음_' + stamp(t.created).replace(/[.: ]/g, '') + '.' + ext;
+      a.download = baseName(t) + '.' + ext;
       document.body.appendChild(a); a.click(); a.remove();
     };
     const del = document.createElement('button');
-    del.className = 's del'; del.textContent = '삭제';
+    del.className = 's del'; del.textContent = '기기에서 삭제';
     del.onclick = async () => {
-      if (!confirm('이 기기에서 녹음을 삭제할까요?' + (t.notion === 'done' ? '\n(노션에 올라간 녹음은 그대로 남습니다)' : ''))) return;
+      if (!confirm('이 기기에서 녹음을 삭제할까요?' + (t.notion === 'done' ? '\n(노션에 올라간 녹음은 그대로 남습니다. 노션 것도 지우려면 먼저 "노션에서 삭제"를 누르세요)' : ''))) return;
       await delTake(t.id); render();
     };
     acts.append(dl, del);
@@ -283,14 +333,13 @@ async function start() {
     const duration = (Date.now() - startAt) / 1000;
     const blob = new Blob(chunks, { type: (rec.mimeType || type || 'audio/webm').split(';')[0] });
     stream.getTracks().forEach(t => t.stop());
-    let take = { key, topic, created: Date.now(), duration, type: blob.type, blob };
-    try { take.id = await addTake(take); }
-    catch (e) { showErr('녹음을 저장하지 못했습니다.'); }
+    const take = { key, topic, created: Date.now(), duration, type: blob.type, blob };
+    try {
+      take.seq = (await ensureSeq(await listTakes())) + 1;
+      take.id = await addTake(take);
+    } catch (e) { showErr('녹음을 저장하지 못했습니다.'); }
     await render();
-    if (take.id && canUpload() && $('auto').checked && store.get('recorderSecret')) {
-      const n = (await listTakes()).length;
-      upload(take, n + '번째 녹음');
-    }
+    if (take.id && canUpload() && $('auto').checked && store.get('recorderSecret')) upload(take);
   };
   rec.start(250);
   startAt = Date.now();
